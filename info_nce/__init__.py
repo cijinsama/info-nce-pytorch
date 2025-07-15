@@ -47,75 +47,103 @@ class InfoNCE(nn.Module):
         >>> output = loss(query, positive_key, negative_keys)
     """
 
-    def __init__(self, temperature=0.1, reduction='mean', negative_mode='unpaired'):
+    def __init__(self, temperature=0.1, reduction='mean', negative_mode='unpaired', mode='default'):
         super().__init__()
         self.temperature = temperature
         self.reduction = reduction
         self.negative_mode = negative_mode
+        self.mode = mode
 
-    def forward(self, query, positive_key, negative_keys=None):
-        return info_nce(query, positive_key, negative_keys,
+    def forward(self, query, positive_key=None, negative_keys=None, labels=None):
+        return info_nce(query, 
+                        positive_key=positive_key,
+                        negative_keys=negative_keys,
+                        labels=labels,
                         temperature=self.temperature,
                         reduction=self.reduction,
-                        negative_mode=self.negative_mode)
+                        negative_mode=self.negative_mode,
+                        mode=self.mode)
 
 
-def info_nce(query, positive_key, negative_keys=None, temperature=0.1, reduction='mean', negative_mode='unpaired'):
-    # Check input dimensionality.
+def info_nce(query, positive_key=None, negative_keys=None, labels=None, temperature=0.1,
+             reduction='mean', negative_mode='unpaired', mode='default'):
     if query.dim() != 2:
         raise ValueError('<query> must have 2 dimensions.')
-    if positive_key.dim() != 2:
-        raise ValueError('<positive_key> must have 2 dimensions.')
-    if negative_keys is not None:
-        if negative_mode == 'unpaired' and negative_keys.dim() != 2:
-            raise ValueError("<negative_keys> must have 2 dimensions if <negative_mode> == 'unpaired'.")
-        if negative_mode == 'paired' and negative_keys.dim() != 3:
-            raise ValueError("<negative_keys> must have 3 dimensions if <negative_mode> == 'paired'.")
 
-    # Check matching number of samples.
-    if len(query) != len(positive_key):
-        raise ValueError('<query> and <positive_key> must must have the same number of samples.')
-    if negative_keys is not None:
-        if negative_mode == 'paired' and len(query) != len(negative_keys):
-            raise ValueError("If negative_mode == 'paired', then <negative_keys> must have the same number of samples as <query>.")
-
-    # Embedding vectors should have same number of components.
-    if query.shape[-1] != positive_key.shape[-1]:
-        raise ValueError('Vectors of <query> and <positive_key> should have the same number of components.')
-    if negative_keys is not None:
-        if query.shape[-1] != negative_keys.shape[-1]:
-            raise ValueError('Vectors of <query> and <negative_keys> should have the same number of components.')
-
-    # Normalize to unit vectors
-    query, positive_key, negative_keys = normalize(query, positive_key, negative_keys)
-    if negative_keys is not None:
-        # Explicit negative keys
-
-        # Cosine between positive pairs
-        positive_logit = torch.sum(query * positive_key, dim=1, keepdim=True)
-
-        if negative_mode == 'unpaired':
-            # Cosine between all query-negative combinations
-            negative_logits = query @ transpose(negative_keys)
-
-        elif negative_mode == 'paired':
-            query = query.unsqueeze(1)
-            negative_logits = query @ transpose(negative_keys)
-            negative_logits = negative_logits.squeeze(1)
-
-        # First index in last dimension are the positive samples
-        logits = torch.cat([positive_logit, negative_logits], dim=1)
-        labels = torch.zeros(len(logits), dtype=torch.long, device=query.device)
+    if mode == 'label':
+        if labels is None:
+            raise ValueError('In <label> mode, <labels> must be provided.')
+        if labels.shape[0] != query.shape[0]:
+            raise ValueError('<labels> must match the number of samples in <query>.')
     else:
-        # Negative keys are implicitly off-diagonal positive keys.
+        if positive_key is None:
+            raise ValueError('In <default> mode, <positive_key> must be provided.')
 
-        # Cosine between all combinations
-        logits = query @ transpose(positive_key)
+        if positive_key.dim() != 2:
+            raise ValueError('<positive_key> must have 2 dimensions.')
 
-        # Positive keys are the entries on the diagonal
-        labels = torch.arange(len(query), device=query.device)
+        if len(query) != len(positive_key):
+            raise ValueError('<query> and <positive_key> must have the same number of samples.')
 
-    return F.cross_entropy(logits / temperature, labels, reduction=reduction)
+        if negative_keys is not None:
+            if negative_mode == 'unpaired' and negative_keys.dim() != 2:
+                raise ValueError("<negative_keys> must have 2 dimensions if <negative_mode> == 'unpaired'.")
+            if negative_mode == 'paired' and negative_keys.dim() != 3:
+                raise ValueError("<negative_keys> must have 3 dimensions if <negative_mode> == 'paired'.")
+            if negative_mode == 'paired' and len(query) != len(negative_keys):
+                raise ValueError("If negative_mode == 'paired', then <negative_keys> must have the same number of samples as <query>.")
+            if query.shape[-1] != negative_keys.shape[-1]:
+                raise ValueError('Vectors of <query> and <negative_keys> should have the same number of components.')
+
+        if query.shape[-1] != positive_key.shape[-1]:
+            raise ValueError('Vectors of <query> and <positive_key> should have the same number of components.')
+
+    # Normalize embeddings
+    query, positive_key, negative_keys = normalize(query, positive_key, negative_keys)
+
+    if mode == 'label':
+        sim_matrix = query @ query.T  # [N, N]
+
+        # construct positive
+        positive_mask = labels.unsqueeze(0) == labels.unsqueeze(1)  # [N, N]
+
+        if not positive_mask.any(dim=1).all():
+            raise ValueError("Each sample must have at least one sample with the same label (including itself).")
+
+        logits = sim_matrix / temperature  # [N, N]
+
+        # numeric stable：reduce max each row
+        logits_max, _ = logits.max(dim=1, keepdim=True)
+        logits = logits - logits_max.detach()
+
+        # log-softmax
+        log_probs = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+
+        mean_log_prob_pos = (log_probs * positive_mask.float()).sum(dim=1) / positive_mask.float().sum(dim=1)
+
+        loss = -mean_log_prob_pos
+        return loss.mean() if reduction == 'mean' else loss
+
+    else:
+        if negative_keys is not None:
+            positive_logit = torch.sum(query * positive_key, dim=1, keepdim=True)
+
+            if negative_mode == 'unpaired':
+                negative_logits = query @ transpose(negative_keys)
+
+            elif negative_mode == 'paired':
+                query = query.unsqueeze(1)
+                negative_logits = query @ transpose(negative_keys)
+                negative_logits = negative_logits.squeeze(1)
+
+            logits = torch.cat([positive_logit, negative_logits], dim=1)
+            labels = torch.zeros(len(logits), dtype=torch.long, device=query.device)
+
+        else:
+            logits = query @ transpose(positive_key)
+            labels = torch.arange(len(query), device=query.device)
+
+        return F.cross_entropy(logits / temperature, labels, reduction=reduction)
 
 
 def transpose(x):
